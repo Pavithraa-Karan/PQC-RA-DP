@@ -17,7 +17,9 @@ from __future__ import annotations
 import math
 import csv
 import io
-from typing import Dict, Tuple, List
+import os
+import json
+from typing import Dict, Tuple, List, Optional
 
 # Sensitivity mapping (default)
 SENSITIVITY_MAP = {
@@ -423,6 +425,14 @@ def score_row_from_csv_row(row: Dict[str, str], weights: Dict[str, float] | None
     except Exception:
         pass
 
+    # If caller supplied explicit weights use them; otherwise derive adaptive weights
+    if weights is None:
+        # try to detect a Sector column (case-insensitive)
+        sector = _parse_text_field(row, ["Sector", "sector", "Industry", "industry"], default=None)
+        # load threat feed once and pass through to per-row calculator
+        threat_feed = load_threat_feed()
+        weights = compute_dynamic_weights_from_row(row, sector=sector, threat_feed=threat_feed)
+
     score, breakdown = compute_qars(X=X, Y=Y, Z=Z, sensitivity=sensitivity, algorithm=algorithm, q=q, weights=weights, alpha=alpha, linear_t=linear_t)
 
     out = dict(row)  # copy original fields
@@ -458,6 +468,128 @@ def batch_score_csv_string(csv_text: str, weights: Dict[str, float] | None = Non
     for r in out_rows:
         writer.writerow(r)
     return out_io.getvalue()
+
+
+def load_threat_feed(path: Optional[str] = None) -> Dict[str, float]:
+    """Load a simple threat feed mapping {sector: severity(0..1)}.
+
+    Path resolution order:
+      - explicit path
+      - env QARS_THREAT_FEED
+      - data/threat_feed.json in workspace
+    If file missing or malformed return empty dict.
+    """
+    fp = path or os.environ.get("QARS_THREAT_FEED") or os.path.join(os.path.dirname(__file__), "..", "data", "threat_feed.json")
+    try:
+        if not fp or not os.path.exists(fp):
+            return {}
+        with open(fp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # normalize values to 0..1 floats
+        return {k: max(0.0, min(1.0, float(v))) for k, v in (data or {}).items()}
+    except Exception:
+        return {}
+
+
+def compute_dynamic_weights_from_row(
+    row: Dict[str, str],
+    sector: Optional[str] = None,
+    threat_feed: Optional[Dict[str, float]] = None,
+    max_shift: float = 0.15,
+    critical_supply_time: float = 5.0,
+) -> Dict[str, float]:
+    """Compute adaptive weights wT,wS,wE for a single asset row.
+
+    Strategy:
+      - Start from sector base priors (sector_profiles).
+      - Use threat_feed severity (0..1) for sector/global to produce an urgency
+        value that increases Timeline (wT) and Exposure (wE) importance.
+      - Use asset sensitivity to increase wS when high.
+      - Use supply-chain/vendor agility (vendor_pqc_compliant, third_party_used,
+        vendor supply time) to increase wE when vendor agility is poor.
+      - Normalize final weights to sum to 1.
+
+    Expected row fields (case-insensitive): vendor_pqc_compliant, third party used,
+    vendor supply time, data shelf life, Data Sensisitivity, Algo, data trans, app type, Frequency.
+    """
+    # base priors
+    base = sector_profiles.get((sector or "").strip(), sector_profiles["Default"])
+    wT = float(base.get("wT", 1.0 / 3.0))
+    wS = float(base.get("wS", 1.0 / 3.0))
+    wE = float(base.get("wE", 1.0 / 3.0))
+
+    # load threat severity: per-sector then global
+    tf = threat_feed or load_threat_feed()
+    sev = 0.0
+    if sector:
+        sev = tf.get(sector.strip(), tf.get(sector.strip().lower(), 0.0))
+    if sev == 0.0:
+        # fallback to a global indicator if present
+        sev = tf.get("global", tf.get("Global", 0.0))
+
+    # Urgency-driven shift from sensitivity -> timeline/exposure
+    # delta in [0,1] derived from threat severity
+    delta = max(0.0, min(1.0, float(sev)))
+    # Move up to max_shift from sensitivity to timeline+exposure when delta==1
+    shift_total = max_shift * delta
+    # reduce sensitivity proportionally and add to T & E
+    wS = max(0.0, wS - shift_total)
+    # distribute increase to T and E weighted by their base sizes
+    base_share = (wT + wE) if (wT + wE) > 0 else 1.0
+    wT += shift_total * (wT / base_share)
+    wE += shift_total * (wE / base_share)
+
+    # Asset sensitivity multiplier: raise wS when asset sensitivity > moderate
+    sens_label = _parse_text_field(row, ["Data Sensisitivity", "data sensisitivity", "data sensitivity", "Data Sensitivity"], default="Moderate")
+    sens_val = fsens(sens_label)  # 0..1
+    # Sensitivity boost up to +25% of current wS when sensitivity high
+    sens_boost = max(0.0, (sens_val - 0.5) * 0.5)
+    wS *= (1.0 + sens_boost)
+
+    # Exposure adjustments using compute_E_from_attributes to get exposure estimate
+    vendor_supply = _parse_float_field(row, ["vendor supply time", "vendor_supply_time", "vendor supply"], default=0.0)
+    third_used = _parse_yesno_field(row, ["third party used", "third_party_used", "third party used?"])
+    third_qsafe = _parse_yesno_field(row, ["is third party quantum safe", "is third party quantum safe?", "third party quantum safe"])
+    vendor_ok = _parse_yesno_field(row, ["vendor pqc compliant", "vendor_pqc_compliant", "vendor pqc"])
+    algorithm = _parse_text_field(row, ["Algo", "algo", "Algorithm"], default="RSA")
+    data_trans = _parse_text_field(row, ["data trans(algo)", "data trans", "data transmission", "data trans"], "").lower()
+    app_type = _parse_text_field(row, ["app_type", "app type", "App_type", "Application type", "Application"], "").lower()
+    freq = _parse_float_field(row, ["Frequency", "frequency", "freq"], default=0.0)
+    shelf = _parse_float_field(row, ["data self life", "data shelf life", "data selflife", "data_shelf_life"], default=0.0)
+
+    E_est = compute_E_from_attributes(
+        algorithm=algorithm,
+        key_size=None,
+        data_trans=data_trans,
+        app_type=app_type,
+        frequency=freq,
+        data_shelf_life=shelf,
+        third_party_used=third_used,
+        third_party_qsafe=third_qsafe,
+        vendor_pqc_compliant=vendor_ok,
+        arch_flex=None,
+    )
+
+    # Vendor Agility Score (VAS) 0..1: higher => more agile/resilient => reduces exposure weight growth
+    # compliance_score: 1.0 if vendor_pqc_compliant True, 0.5 if unknown, 0.0 if False
+    if vendor_ok:
+        compliance_score = 1.0
+    else:
+        # if explicit "no" detected vendor_ok False => 0.0 ; otherwise treat as 0.5 (unknown)
+        compliance_score = 0.0 if _find_key(row, ["vendor pqc compliant", "vendor_pqc_compliant", "vendor pqc"]) else 0.5
+    third_multiplier = 0.7 if third_used else 1.0
+    supply_time_factor = 1.0 - min(1.0, float(vendor_supply) / float(max(0.0001, critical_supply_time)))
+    VAS = compliance_score * third_multiplier * supply_time_factor
+
+    # Increase wE when computed exposure is high and VAS is poor, scaled by threat severity
+    exposure_pressure = (E_est + (1.0 - VAS)) / 2.0
+    wE *= (1.0 + exposure_pressure * 0.8 * delta)
+
+    # Final normalization to ensure sum == 1
+    total = wT + wS + wE
+    if total <= 0:
+        return {"wT": 1.0 / 3.0, "wS": 1.0 / 3.0, "wE": 1.0 / 3.0}
+    return {"wT": wT / total, "wS": wS / total, "wE": wE / total}
 
 
 if __name__ == "__main__":
